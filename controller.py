@@ -1,20 +1,23 @@
 """
-Your drift controller lives here.
-
-This file is HOT-RELOADED by sil_beamng.py while the sim runs: save it and
-the new control law takes effect on the next tick, without relaunching BeamNG.
-If you introduce an error, the sim keeps running on the previous good version
-and prints the traceback - fix and save again.
-
-Numeric gains come from gains.json (also reloaded live), so for plain gain
-tuning you don't even need to touch this file.
+Vehicle controller — hot-reloaded by sil_beamng.py while the sim runs.
 
 Contract:
     DriftController(params: dict)
     controller(state: dict, t: float, dt: float) -> (throttle, brake, delta)
-        state: X, Y, psi, vx, vy, r, ax, ay, speed   (see sil_beamng.get_state)
+        state: X, Y, psi, vx, vy, r, ax, ay, speed, track_frame (optional)
         delta: front road-wheel angle [rad]
-Internal attributes (e.g. integrators) are preserved across hot reloads.
+
+track_frame is injected by the main loop when a Track is active:
+    state["track_frame"] = (e_y, e_psi, kappa_preview, track_idx)
+
+Modes (set "mode" in gains.json):
+    "path"   Stanley path-following, no sideslip target (current default)
+    "drift"  Sideslip-tracking countersteer — placeholder for RL policy drop-in
+
+RL drop-in point:
+    In "path" mode, the controller consumes (e_y, e_psi, kappa_preview) from
+    track_frame.  A trained RL policy would consume track.obs(...) instead and
+    output (delta, throttle) directly — swap __call__ body for that.
 """
 
 import math
@@ -23,36 +26,94 @@ import math
 class DriftController:
     def __init__(self, params: dict):
         self.params = params
-        # --- internal state (preserved across hot reloads) ---
+        # longitudinal integrator
         self.speed_err_int = 0.0
+        # last delta for smoothness (unused in path mode but preserved for drift)
+        self._last_delta = 0.0
 
     def update_params(self, params: dict):
-        """Called when gains.json changes; merge new values in."""
         self.params.update(params)
 
     def __call__(self, state: dict, t: float, dt: float):
-        p = self.params
+        mode = self.params.get("mode", "path")
+        if mode == "path":
+            return self._path(state, dt)
+        else:
+            return self._drift(state, dt)
 
-        # ---- longitudinal: hold target speed (PI on throttle) ----
-        v = state["speed"]
-        e_v = p["target_speed"] - v
+    # ------------------------------------------------------------------ path mode
+
+    def _path(self, state: dict, dt: float):
+        p = self.params
+        vx = state["vx"]
+        speed = state["speed"]
+
+        # --- longitudinal: PI speed hold ---
+        e_v = p["target_speed"] - speed
         self.speed_err_int += e_v * dt
-        # simple anti-windup clamp
         self.speed_err_int = max(-5.0, min(5.0, self.speed_err_int))
         u = p["kp_speed"] * e_v + p["ki_speed"] * self.speed_err_int
-
         throttle = max(0.0, min(1.0, u))
-        brake = max(0.0, min(1.0, -u)) if u < 0 else 0.0
+        brake    = max(0.0, min(1.0, -u)) if u < 0 else 0.0
 
-        # ---- lateral: track a target sideslip angle with countersteer ----
-        beta = math.atan2(state["vy"], state["vx"]) if v > 0.5 else 0.0
-        beta_tgt = math.radians(p["target_beta_deg"])
-        # countersteer toward target beta, with yaw-rate damping
-        delta = (
-            p["kp_beta"] * (beta_tgt - beta)
-            - p["kd_r"] * state["r"]
-        )
+        # --- lateral: Stanley steering law ---
+        # delta = e_psi + arctan(k_e * e_y / max(vx, v_min))
+        # k_e  : cross-track gain
+        # v_min: softens gain at low speed
+        tf = state.get("track_frame")
+        if tf is None:
+            # no track loaded — go straight
+            return throttle, brake, 0.0
+
+        e_y, e_psi, kappa_preview, _idx = tf
+
+        # feedforward curvature: anticipate the upcoming bend
+        # kappa_preview[0] is at current position, [1] is 10 m ahead, [2] is 25 m ahead
+        kappa_ff = kappa_preview[1] if len(kappa_preview) > 1 else 0.0
+
+        k_e   = p.get("k_stanley", 1.5)
+        v_min = p.get("v_min_stanley", 2.0)
+        L     = p.get("wheelbase", 2.7)       # [m] etk800 wheelbase (approx)
+
+        # Stanley law on front axle — project e_y to front axle
+        # (using simplified: front-axle cross-track ≈ e_y + L/2 * sin(e_psi))
+        e_y_front = e_y + (L / 2.0) * math.sin(e_psi)
+
+        delta = e_psi + math.atan2(k_e * e_y_front, max(abs(vx), v_min))
+
+        # feedforward: bicycle model steady-state delta = kappa * L
+        delta += p.get("k_ff", 0.6) * kappa_ff * L
+
         lim = math.radians(p["delta_limit_deg"])
         delta = max(-lim, min(lim, delta))
 
+        self._last_delta = delta
+        return throttle, brake, delta
+
+    # ------------------------------------------------------------------ drift mode (placeholder)
+
+    def _drift(self, state: dict, dt: float):
+        """Sideslip-targeting countersteer — same law as original controller.py.
+
+        RL drop-in: replace this body with a forward pass through a loaded
+        SB3 policy, consuming state["track_obs"] built by track.obs().
+        """
+        p = self.params
+        v = state["speed"]
+
+        e_v = p["target_speed"] - v
+        self.speed_err_int += e_v * dt
+        self.speed_err_int = max(-5.0, min(5.0, self.speed_err_int))
+        u = p["kp_speed"] * e_v + p["ki_speed"] * self.speed_err_int
+        throttle = max(0.0, min(1.0, u))
+        brake    = max(0.0, min(1.0, -u)) if u < 0 else 0.0
+
+        beta = math.atan2(state["vy"], state["vx"]) if v > 0.5 else 0.0
+        beta_tgt = math.radians(p.get("target_beta_deg", -5.0))
+        delta = (
+            p.get("kp_beta", 12.0) * (beta_tgt - beta)
+            - p.get("kd_r", 0.15) * state["r"]
+        )
+        lim = math.radians(p["delta_limit_deg"])
+        delta = max(-lim, min(lim, delta))
         return throttle, brake, delta

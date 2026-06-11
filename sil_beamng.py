@@ -50,6 +50,8 @@ import controller as controller_module
 from beamngpy import BeamNGpy, Scenario, Vehicle
 from beamngpy.sensors import Electrics
 
+from track import Track, DEFAULT_LOOKAHEAD
+
 # --------------------------------------------------------------------------- #
 # Configuration  (edit these)                                                  #
 # --------------------------------------------------------------------------- #
@@ -62,7 +64,7 @@ MAP = "smallgrid"          # empty flat infinite plane; try "gridmap_v2" for a t
 VEHICLE_MODEL = "etk800"   # rwd sedan, decent for drifting; e.g. "sunburst2" (rwd) also good
 
 SPAWN_POS = (0.0, 0.0, 0.5)
-SPAWN_ROT_QUAT = (0.0, 0.0, 0.0, 1.0)   # identity -> facing +x
+SPAWN_ROT_QUAT = (0.0, 0.0, 1.0, 0.0)   # identity -> facing +x
 
 # Deterministic SIL timing.
 PHYSICS_HZ = 100           # simulation steps per second BeamNG advances
@@ -76,6 +78,39 @@ DT = STEPS_PER_TICK / PHYSICS_HZ        # control timestep [s]
 # etk800; calibrate with calibrate_max_steer() for accuracy.
 MAX_STEER_ANGLE = math.radians(30.0)
 
+# --------------------------------------------------------------------------- #
+# Track configuration                                                          #
+# --------------------------------------------------------------------------- #
+# Set TRACK_MODE to "circle" or "random".  The track is centred near SPAWN_POS
+# so the car starts on the line.  Set to None to disable path-following.
+TRACK_MODE   = "circle"        # "circle" | "random" | None
+TRACK_RADIUS = 40.0            # [m] used only for TRACK_MODE="circle"
+TRACK_SEED   = 42              # RNG seed for "random"
+TRACK_LENGTH = 600.0           # [m] open-track arc length for "random"
+
+# Lookahead distances fed to track.frame() and track.obs() [m].
+# Matches driftRL defaults (0, 10, 25 m) so trained policies transfer.
+LOOKAHEAD = DEFAULT_LOOKAHEAD  # override e.g. (0.0, 5.0, 15.0, 30.0)
+
+OFF_TRACK_RESET = True         # True = teleport+continue; False = raise KeyboardInterrupt
+
+
+# --------------------------------------------------------------------------- #
+# Track factory                                                                #
+# --------------------------------------------------------------------------- #
+def _make_track() -> Track | None:
+    if TRACK_MODE is None:
+        return None
+    # circle centred so spawn (0, 0) is on the track, car faces +X tangent
+    origin = (0.0, -TRACK_RADIUS)  # centre below spawn so the track passes through (0,0)
+    if TRACK_MODE == "circle":
+        return Track.circle(radius=TRACK_RADIUS, origin=origin)
+    elif TRACK_MODE == "random":
+        rng = np.random.default_rng(TRACK_SEED)
+        return Track.random_track(rng, length=TRACK_LENGTH, origin=(0.0, 0.0))
+    else:
+        raise ValueError(f"Unknown TRACK_MODE {TRACK_MODE!r}")
+
 
 # --------------------------------------------------------------------------- #
 # Interface                                                                    #
@@ -87,6 +122,10 @@ class BeamNGSIL:
         self.bng: BeamNGpy | None = None
         self.vehicle: Vehicle | None = None
         self._prev = None  # (t, psi, vx_body, vy_body) for finite differencing
+
+        # track (None when TRACK_MODE is None)
+        self.track: Track | None = _make_track()
+        self._track_hint: int = 0  # nearest-sample search hint, updated each tick
 
     # ---- lifecycle -------------------------------------------------------- #
     def open(self, launch: bool = True):
@@ -102,14 +141,23 @@ class BeamNGSIL:
         scenario.make(self.bng)
 
         # deterministic lockstep: physics only advances when we step it
+        print("[sil] setting deterministic...", flush=True)
         self.bng.settings.set_deterministic(PHYSICS_HZ)
+        print("[sil] loading scenario...", flush=True)
         self.bng.scenario.load(scenario)
+        print("[sil] starting scenario...", flush=True)
         self.bng.scenario.start()
+        print("[sil] pausing...", flush=True)
         self.bng.control.pause()
 
-        # let the car settle on the ground
-        self.bng.control.step(int(PHYSICS_HZ * 1.0))
+        # let the car settle on the ground — step in small batches so BeamNG
+        # doesn't time out on a single large RPC call
+        print("[sil] settling (2 s)...", flush=True)
+        for _ in range(4):
+            self.bng.control.step(int(PHYSICS_HZ * 0.5))
+        print("[sil] priming state...", flush=True)
         self._prime_state()
+        print("[sil] ready.", flush=True)
         return self
 
     def close(self):
@@ -163,7 +211,7 @@ class BeamNGSIL:
 
         self._prev = (s["t"], s["psi"], s["vx"], s["vy"])
 
-        return {
+        state = {
             "X": s["X"],
             "Y": s["Y"],
             "psi": s["psi"],
@@ -174,6 +222,27 @@ class BeamNGSIL:
             "ay": ay,
             "speed": math.hypot(s["vx"], s["vy"]),
         }
+
+        # --- track-frame augmentation ---
+        if self.track is not None:
+            e_y, e_psi, kappa_p, idx = self.track.frame(
+                s["X"], s["Y"], s["psi"], self._track_hint, LOOKAHEAD
+            )
+            self._track_hint = idx
+            state["track_frame"] = (e_y, e_psi, kappa_p, idx)
+
+            # full RL obs vector (scaled) — ready for policy forward-pass
+            obs, *_ = self.track.obs(
+                s["X"], s["Y"], s["psi"],
+                s["vx"], s["vy"], r,
+                idx, LOOKAHEAD,
+            )
+            state["track_obs"] = obs
+
+            state["off_track"] = self.track.off_track(e_y)
+            state["track_end"] = self.track.at_end(idx)
+
+        return state
 
     # ---- actuation -------------------------------------------------------- #
     def apply_control(self, throttle: float, brake: float, delta: float):
@@ -263,39 +332,71 @@ class HotController:
 # Main SIL loop                                                                #
 # --------------------------------------------------------------------------- #
 def main():
+    from debug_view import DebugView
+
     sil = BeamNGSIL().open(launch=True)
     controller = HotController()
     print(f"Connected. DT={DT*1000:.1f} ms  ({CONTROL_HZ} Hz control, "
           f"{PHYSICS_HZ} Hz physics)")
-    print("State keys:", list(sil.get_state().keys()))
     print("Edit gains.json or controller.py and save to tune live. Ctrl-C to stop.")
+
+    if sil.track is not None:
+        print(f"Track: {TRACK_MODE}  n={sil.track.n} pts  "
+              f"length={sil.track.length:.0f} m  "
+              f"half_width={sil.track.half_width:.1f} m")
+
+    view = DebugView(sil.track, update_hz=15.0)
 
     t = 0.0
     try:
         while True:
             controller.maybe_reload()
             state = sil.get_state()
+
+            # --- off-track / end-of-track handling ---
+            if state.get("off_track"):
+                e_y = state["track_frame"][0]
+                print(f"\n[track] OFF TRACK  e_y={e_y:+.2f} m  t={t:.1f} s")
+                if OFF_TRACK_RESET:
+                    sil.reset()
+                    sil._track_hint = 0
+                    t = 0.0
+                    continue
+                else:
+                    break
+
+            if state.get("track_end"):
+                print(f"\n[track] reached end of open track  t={t:.1f} s")
+                break
+
             try:
                 throttle, brake, delta = controller(state, t, DT)
             except Exception:
-                # a runtime error in the control law shouldn't crash the sim
                 print("\n[controller] runtime error (coasting):")
                 traceback.print_exc()
                 throttle, brake, delta = 0.0, 0.0, 0.0
+
             sil.apply_control(throttle, brake, delta)
             sil.step()
             t += DT
 
+            view.update(state, t)
+
+            tf = state.get("track_frame")
+            track_str = (
+                f"  e_y={tf[0]:+5.2f} e_psi={math.degrees(tf[1]):+5.1f}deg"
+                f"  k={tf[2][1]*1000:.1f}‰"
+            ) if tf else ""
             print(
                 f"t={t:6.2f}  X={state['X']:7.2f} Y={state['Y']:7.2f}  "
-                f"psi={math.degrees(state['psi']):7.1f}deg  "
-                f"vx={state['vx']:6.2f} vy={state['vy']:6.2f}  "
-                f"r={state['r']:6.2f}  v={state['speed']:5.2f}",
+                f"v={state['speed']:5.2f} vx={state['vx']:5.2f} vy={state['vy']:5.2f}"
+                + track_str,
                 end="\r",
             )
     except KeyboardInterrupt:
         print("\nStopping.")
     finally:
+        view.close()
         sil.close()
 
 

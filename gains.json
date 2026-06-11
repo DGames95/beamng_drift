@@ -1,9 +1,18 @@
 {
+  "mode": "path",
+
   "target_speed": 12.0,
   "kp_speed": 0.15,
   "ki_speed": 0.05,
-  "target_beta_deg": -5.0,
-  "kp_beta": 12,
-  "kd_r": 0.15,
-  "delta_limit_deg": 30.0
+
+  "k_stanley": 1.5,
+  "k_ff": 0.6,
+  "v_min_stanley": 2.0,
+  "wheelbase": 2.7,
+  "delta_limit_deg": 30.0,
+
+  "_comment_drift": "drift-mode gains below (mode=drift to activate)",
+  "target_beta_deg": -12.0,
+  "kp_beta": 1.20,
+  "kd_r": 0.15
 }
