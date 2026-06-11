@@ -1,0 +1,3 @@
+[submodule "driftRL"]
+	path = driftRL
+	url = git@github.com:DGames95/driftRL.git

@@ -1,0 +1,9 @@
+{
+  "target_speed": 12.0,
+  "kp_speed": 0.15,
+  "ki_speed": 0.05,
+  "target_beta_deg": -5.0,
+  "kp_beta": 12,
+  "kd_r": 0.15,
+  "delta_limit_deg": 30.0
+}
