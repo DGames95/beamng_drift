@@ -12,15 +12,34 @@ track_frame is injected by the main loop when a Track is active:
 
 Modes (set "mode" in gains.json):
     "path"   Stanley path-following, no sideslip target (current default)
-    "drift"  Sideslip-tracking countersteer — placeholder for RL policy drop-in
+    "drift"  Sideslip-tracking countersteer — analytic placeholder
+    "rl"     Forward pass through a trained stable-baselines3 PPO policy
+             (driftRL), consuming state["track_obs"] -> (delta, throttle)
 
-RL drop-in point:
-    In "path" mode, the controller consumes (e_y, e_psi, kappa_preview) from
-    track_frame.  A trained RL policy would consume track.obs(...) instead and
-    output (delta, throttle) directly — swap __call__ body for that.
+RL mode:
+    state["track_obs"] is the 8-vector [vx, vy, r, e_y, e_psi, kappa@0/10/25 m]
+    scaled by driftRL's OBS_SCALE (see track.py / drift_env.py).  The policy
+    outputs [delta in +-0.5 rad, T in +-1]; T is split into throttle/brake.
+    Set "model_path" in gains.json to choose the model (default below).
 """
 
 import math
+
+import numpy as np
+
+
+DEFAULT_MODEL_PATH = "models/drift_circle/best_model"
+
+# Cache loaded policies by path so PPO.load runs once, not on every hot-reload.
+_MODEL_CACHE = {}
+
+
+def _load_policy(path: str):
+    if path not in _MODEL_CACHE:
+        # lazy import so "path"/"drift" modes work without sb3/torch installed
+        from stable_baselines3 import PPO
+        _MODEL_CACHE[path] = PPO.load(path, device="cpu")
+    return _MODEL_CACHE[path]
 
 
 class DriftController:
@@ -38,6 +57,8 @@ class DriftController:
         mode = self.params.get("mode", "path")
         if mode == "path":
             return self._path(state, dt)
+        elif mode == "rl":
+            return self._rl(state)
         else:
             return self._drift(state, dt)
 
@@ -89,6 +110,29 @@ class DriftController:
 
         self._last_delta = delta
         return throttle, brake, delta
+
+    # ------------------------------------------------------------------ rl mode
+
+    def _rl(self, state: dict):
+        """Forward pass through a trained driftRL PPO policy.
+
+        Consumes state["track_obs"] (scaled to match driftRL's OBS_SCALE) and
+        returns (throttle, brake, delta).  Action is [delta in +-0.5 rad,
+        T in +-1]; T splits into throttle/brake.
+        """
+        obs = state.get("track_obs")
+        if obs is None:
+            # no track loaded — nothing to observe, coast straight
+            return 0.0, 0.0, 0.0
+
+        policy = _load_policy(self.params.get("model_path", DEFAULT_MODEL_PATH))
+        action, _ = policy.predict(
+            np.asarray(obs, dtype=np.float32), deterministic=True
+        )
+        delta = float(np.clip(action[0], -0.5, 0.5))
+        T = float(np.clip(action[1], -1.0, 1.0))
+        self._last_delta = delta
+        return max(0.0, T), max(0.0, -T), delta
 
     # ------------------------------------------------------------------ drift mode (placeholder)
 

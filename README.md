@@ -11,8 +11,9 @@ vehicle physics.
 | `sil_beamng.py` | Connects to BeamNG, loads an empty world, runs the deterministic SIL loop, reads state, applies control. Hosts `BeamNGSIL` and `HotController`. |
 | `controller.py` | The control law (`DriftController`). Hot-reloaded at runtime. |
 | `gains.json` | Numeric gains / setpoints. Re-read live when the file changes. |
-| `requirements.txt` | Python deps (`beamngpy==1.35.1`, `numpy`). |
+| `requirements.txt` | Python deps (`beamngpy`, `numpy`, `stable-baselines3`, `torch`). |
 | `driftRL/` | Git submodule (`git@github.com:DGames95/driftRL.git`), tracked separately. |
+| `models/drift_circle/` | Trained PPO policy (`best_model.zip`, `final_model.zip`) from driftRL. |
 
 ## Setup
 
@@ -57,6 +58,21 @@ runs. `Ctrl-C` to stop.
 
 The controller is `controller.py:DriftController`, called as
 `(state, t, dt) -> (throttle, brake, delta)`.
+
+## RL controller
+
+`controller.py` supports `"mode": "rl"` in `gains.json`, which drives the car
+with a trained driftRL PPO policy instead of the hand-written laws. Set
+`"model_path"` (default `models/drift_circle/best_model`) to choose the model.
+Switch live between `rl`, `path`, and `drift` by editing `mode` and saving.
+
+Notes:
+- The policy reads `state["track_obs"]`, an 8-vector scaled by driftRL's
+  `OBS_SCALE`. `track.py:obs()` is kept equal to that scale — change both
+  together.
+- The policy was trained on a 30 m circle, so `TRACK_RADIUS` is set to `30.0`
+  in `sil_beamng.py` to match.
+- Needs `stable-baselines3` + `torch` (in `requirements.txt`).
 
 ## Live tuning
 

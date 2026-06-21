@@ -84,7 +84,7 @@ MAX_STEER_ANGLE = math.radians(30.0)
 # Set TRACK_MODE to "circle" or "random".  The track is centred near SPAWN_POS
 # so the car starts on the line.  Set to None to disable path-following.
 TRACK_MODE   = "circle"        # "circle" | "random" | None
-TRACK_RADIUS = 40.0            # [m] used only for TRACK_MODE="circle"
+TRACK_RADIUS = 30.0            # [m] used only for TRACK_MODE="circle" (matches driftRL training)
 TRACK_SEED   = 42              # RNG seed for "random"
 TRACK_LENGTH = 600.0           # [m] open-track arc length for "random"
 

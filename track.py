@@ -164,14 +164,15 @@ class Track:
         Layout matches DriftEnv (driftRL/drift_env.py):
             [vx, vy, r, e_y, e_psi, kappa_0, kappa_1, ..., kappa_N]
 
-        Scaled by the same OBS_SCALE constants as driftRL so a policy trained
-        there can transfer here with minimal changes:
-            vx /10, vy /5, r /3, e_y /4, e_psi /pi, kappa * 30
+        Scaled by the same OBS_SCALE constants as driftRL (drift_env.py:48) so a
+        policy trained there transfers here directly:
+            vx /20, vy /10, r /2, e_y /4, e_psi /pi, kappa /0.05  (== kappa * 20)
+        Keep this equal to driftRL's OBS_SCALE.
         """
         e_y, e_psi, kappa_p, idx = self.frame(X, Y, psi, hint, lookahead_dists)
         raw = np.array([vx, vy, r, e_y, e_psi, *kappa_p], dtype=np.float32)
         scale = np.array(
-            [10.0, 5.0, 3.0, 4.0, np.pi] + [1.0 / 30.0] * len(lookahead_dists),
+            [20.0, 10.0, 2.0, 4.0, np.pi] + [0.05] * len(lookahead_dists),
             dtype=np.float32,
         )
         return raw / scale, e_y, e_psi, kappa_p, idx

@@ -1,5 +1,6 @@
 {
-  "mode": "path",
+  "mode": "rl",
+  "model_path": "models/drift_circle/best_model",
 
   "target_speed": 12.0,
   "kp_speed": 0.15,

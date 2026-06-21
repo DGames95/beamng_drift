@@ -25,6 +25,12 @@ physics.
 - `r`, `ax`, `ay` are finite-differenced over the fixed control `DT`.
 - The sim runs deterministically (`set_deterministic`) and is advanced with
   `bng.control.step`.
+- `controller.py` has three modes (`gains.json` `"mode"`): `path`/`drift`
+  (analytic) and `rl` (loads an SB3 PPO policy from `"model_path"`, consuming
+  `state["track_obs"]`). Models live in `models/`; needs `stable-baselines3`+`torch`.
+- `track.py:obs()` scaling must stay equal to driftRL's `OBS_SCALE`
+  (`drift_env.py:48`) so trained policies transfer. RL action is
+  `[delta (rad), T]`; `T` splits into throttle (`max(0,T)`) / brake (`max(0,-T)`).
 
 ## Environment
 
