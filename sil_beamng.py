@@ -132,10 +132,14 @@ class BeamNGSIL:
         self.track: Track | None = _make_track()
         self._track_hint: int = 0  # nearest-sample search hint, updated each tick
 
-        # BeamNG steering-sign vs our convention (delta>0 = turn left). Set to
-        # -1 if a positive steering command turns the car right; calibrate once
-        # by measuring the yaw-rate response (see test_sim2real_beamng.py).
-        self.steer_sign: float = 1.0
+        # BeamNG's steering input is OPPOSITE our convention: a positive steering
+        # command turns the car RIGHT, while our delta>0 means turn left. So the
+        # mapping needs steer_sign = -1 (measured: +0.25 steer -> r<0 at speed,
+        # and the circle drift only worked once this was applied). This is a
+        # fixed BeamNG convention — not vehicle- or track-dependent — so it is a
+        # constant default; test_sim2real_beamng.py re-verifies it at speed and
+        # warns on any mismatch rather than trusting a noisy low-speed reading.
+        self.steer_sign: float = -1.0
 
     # ---- lifecycle -------------------------------------------------------- #
     def open(self, launch: bool = True):

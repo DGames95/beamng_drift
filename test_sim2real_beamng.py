@@ -40,10 +40,10 @@ from track import Track, DEFAULT_LOOKAHEAD
 
 # --- CLI defaults, edit these directly rather than retyping flags ---
 DEFAULT_MODEL   = "models/drift_dr_sim2real/best_model"  # PPO .zip (no extension)
-DEFAULT_TRACK   = "circle"   # "circle" | "random"
+DEFAULT_TRACK   = "random"   # "circle" | "random"
 DEFAULT_RADIUS  = 30.0       # circle radius [m]            (--track circle)
 DEFAULT_LENGTH  = 600.0      # open-track length [m]        (--track random)
-DEFAULT_SEED    = 42         # random-track layout seed     (--track random)
+DEFAULT_SEED    = 55         # random-track layout seed     (--track random)
 DEFAULT_START_SPEED = 11.0   # rolling-start speed [m/s] before engaging policy
                              # (== driftRL reset v0; 0 disables -> standstill start)
 DEFAULT_SECONDS = 40.0       # run duration [s]
@@ -110,23 +110,32 @@ def rolling_start(sil, target):
     return speed
 
 
-def calibrate_steering_sign(sil, probe=0.25, ticks=16, throttle=0.3):
-    """Detect BeamNG's steering sign vs our convention (delta>0 -> turn left).
+def calibrate_steering_sign(sil, probe=0.25, ticks=16, throttle=0.3, min_speed=4.0):
+    """Sanity-check BeamNG's steering sign vs our convention (delta>0 -> left).
 
-    Commands a fixed LEFT steer at the current (rolling) speed and measures the
-    yaw-rate response. Our convention is delta>0 -> positive yaw r. If a
-    positive steering command instead yields negative yaw (the car turns
-    right), the sign is flipped, so we return -1 for sil.steer_sign to correct
-    it. Safe either way: a correct sign returns +1 (no change). Returns
-    (sign, mean_r).
+    The sign is a fixed BeamNG convention (sil.steer_sign defaults to -1), so
+    this only VERIFIES it: command a known left steer and measure the yaw
+    response. A positive command that yields negative yaw confirms sign = -1.
+
+    Crucially, a reading is only trusted when the car is actually turning at
+    speed; a low-speed or weak-yaw measurement is noise and returns None so the
+    caller keeps the reliable default instead of flipping the steering on noise
+    (which is what produced the intermittent inverted behaviour). Returns
+    (sign | None, mean_r).
     """
-    delta_cmd = probe * S.MAX_STEER_ANGLE  # -> steering_norm ~= +probe (left)
+    delta_cmd = probe * S.MAX_STEER_ANGLE  # raw +probe left command (pre steer_sign)
     rs = []
     for _ in range(ticks):
-        sil.apply_control(throttle=throttle, brake=0.0, delta=delta_cmd)
+        # bypass steer_sign here so we measure BeamNG's raw response, not the
+        # already-corrected command
+        raw = float(np.clip(delta_cmd / S.MAX_STEER_ANGLE, -1.0, 1.0))
+        sil.vehicle.control(throttle=throttle, brake=0.0, steering=raw, parkingbrake=0.0)
         sil.step()
         rs.append(sil.get_state()["r"])
     mean_r = float(np.mean(rs[ticks // 2:]))  # settled half
+    speed = sil.get_state()["speed"]
+    if speed < min_speed or abs(mean_r) < 0.05:
+        return None, mean_r  # inconclusive -> keep the default sign
     sign = 1.0 if mean_r >= 0.0 else -1.0
     return sign, mean_r
 
@@ -217,16 +226,22 @@ def run(args):
     dt = S.DT
 
     # Get the car ready to actually move from a standstill:
+    #  * recover() — programmatic "press R": clears the stuck/settling spawn
+    #    state that otherwise leaves the car frozen until a manual reset.
     #  * release the parking brake — BeamNG spawns with the handbrake ON, which
     #    locks the rear wheels (symptom: gear 1, full throttle, no motion).
     #  * auto-shifting gearbox ("arcade") — drift configs usually have a MANUAL
     #    transmission and spawn in neutral, so plain throttle did nothing.
     try:
+        sil.vehicle.recover()
+        for _ in range(int(0.5 * S.CONTROL_HZ)):  # let it re-settle after reset
+            sil.step()
         sil.vehicle.set_shift_mode("arcade")
         sil.vehicle.control(throttle=0.0, brake=0.0, parkingbrake=0.0)
         sil.step()
+        sil._prime_state()
     except Exception as e:
-        print(f"[test] gearbox/parkingbrake setup failed ({e}); continuing")
+        print(f"[test] startup recover/gearbox setup failed ({e}); continuing")
 
     # --- rolling start: bring the car up to speed BEFORE engaging the policy ---
     # The policy is trained always starting at ~11 m/s; BeamNG spawns at rest,
@@ -237,14 +252,21 @@ def run(args):
         reached = rolling_start(sil, args.start_speed)
         print(f"[test] rolling start reached {reached:.1f} m/s")
 
-    # --- steering-sign calibration: at speed, command a known left steer and
-    # measure the yaw response, so a flipped BeamNG sign is auto-corrected
-    # (otherwise the car steers the wrong way and drives straight off track).
+    # --- steering-sign sanity check: verify (don't blindly trust) BeamNG's
+    # steering sign against the known default (sil.steer_sign = -1). Only an
+    # at-speed, clear-yaw reading is allowed to override it; a noisy low-speed
+    # reading is ignored, so a failed rolling start can't flip the steering and
+    # cause inverted behaviour.
     sign, mean_r = calibrate_steering_sign(sil)
-    sil.steer_sign = sign
-    print(f"[test] steering sign: +steer -> r={mean_r:+.3f} rad/s  => "
-          f"steer_sign={sign:+.0f} "
-          f"({'matches our convention' if sign > 0 else 'REVERSED — corrected'})")
+    if sign is None:
+        print(f"[test] steering check inconclusive (r={mean_r:+.3f}) — keeping "
+              f"default steer_sign={sil.steer_sign:+.0f} (BeamNG convention)")
+    elif sign != sil.steer_sign:
+        print(f"[test] WARNING: measured steer sign {sign:+.0f} != default "
+              f"{sil.steer_sign:+.0f} (r={mean_r:+.3f}); using measured")
+        sil.steer_sign = sign
+    else:
+        print(f"[test] steering sign confirmed {sign:+.0f} (r={mean_r:+.3f})")
 
     # Re-straighten after the calibration turn so the car engages on a clean,
     # straight trajectory (no residual yaw / lateral velocity). Critical for the
