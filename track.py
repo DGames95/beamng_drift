@@ -25,13 +25,16 @@ RL observation interface:
 
 import numpy as np
 
-DS          = 1.0            # centerline sample spacing [m]
-HALF_WIDTH  = 20.0            # track half-width [m]
+# Random-track generation MUST stay identical to driftRL/track.py so the same
+# seed yields the same layout (and tracks stay in the policy's training
+# distribution). Keep DS / KAPPA_* / SEG_LEN and random_track() in sync with it.
+DS          = 0.5            # centerline sample spacing [m]  (== driftRL)
+HALF_WIDTH  = 20.0           # track half-width [m]  (local: drift room, not from driftRL)
 
-# random track curvature bounds: radii 30-80 m
-KAPPA_LO    = 1.0 / 80.0
-KAPPA_HI    = 1.0 / 30.0
-SEG_LEN     = (40.0, 120.0)  # arc-length range between curvature knots [m]
+# random-track curvature bounds: corner radii 22-60 m  (== driftRL)
+KAPPA_LO    = 1.0 / 60.0
+KAPPA_HI    = 1.0 / 22.0
+SEG_LEN     = (30.0, 80.0)   # arc-length range between curvature knots [m]  (== driftRL)
 
 # default lookahead distances [m] — matches driftRL (0, 10, 25 m ahead)
 DEFAULT_LOOKAHEAD = (0.0, 10.0, 25.0)
@@ -72,18 +75,22 @@ class Track:
         return cls(xy, psi, kappa, closed=True)
 
     @classmethod
-    def random_track(cls, rng, length: float = 600.0, origin=(0.0, 0.0)):
+    def random_track(cls, rng, length: float = 500.0, origin=(0.0, 0.0)):
         """Open track starting at `origin` facing +X.
 
         Curvature is a piecewise-linear profile: random knots every SEG_LEN
-        metres with |kappa| in [KAPPA_LO, KAPPA_HI], alternating sign so the
-        track keeps turning and doesn't self-intersect too quickly.
+        metres with random sign and |kappa| in [KAPPA_LO, KAPPA_HI].
+
+        This MUST match driftRL/track.py random_track() exactly — same
+        constants AND the same RNG draw order (uniform spacing, then
+        rng.choice sign, then uniform magnitude) — so a given seed reproduces
+        the same layout the policy trained on. The only additions are the
+        `origin` offset (applied after, no RNG effect) and the default length.
         """
-        knot_s, knot_k = [0.0], [0.0]
-        sign = 1.0
+        knot_s, knot_k = [0.0], [0.0]      # start straight
         while knot_s[-1] < length:
             knot_s.append(knot_s[-1] + rng.uniform(*SEG_LEN))
-            sign = -sign  # alternate turns for variety; can remove for purely random
+            sign = rng.choice([-1.0, 1.0])
             knot_k.append(sign * rng.uniform(KAPPA_LO, KAPPA_HI))
 
         s     = np.arange(int(length / DS)) * DS
