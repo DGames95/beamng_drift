@@ -26,7 +26,7 @@ RL observation interface:
 import numpy as np
 
 DS          = 1.0            # centerline sample spacing [m]
-HALF_WIDTH  = 5.0            # track half-width [m]
+HALF_WIDTH  = 20.0            # track half-width [m]
 
 # random track curvature bounds: radii 30-80 m
 KAPPA_LO    = 1.0 / 80.0
@@ -164,15 +164,17 @@ class Track:
         Layout matches DriftEnv (driftRL/drift_env.py):
             [vx, vy, r, e_y, e_psi, kappa_0, kappa_1, ..., kappa_N]
 
-        Scaled by the same OBS_SCALE constants as driftRL (drift_env.py:48) so a
-        policy trained there transfers here directly:
-            vx /20, vy /10, r /2, e_y /4, e_psi /pi, kappa /0.05  (== kappa * 20)
-        Keep this equal to driftRL's OBS_SCALE.
+        Scaled by the same OBS_SCALE constants as driftRL (drift_env.py
+        OBS_SCALE) so a policy trained there transfers here directly:
+            vx /4, vy /1, r /0.5, e_y /1.5, e_psi /0.3, kappa /0.05
+        These MUST equal driftRL's OBS_SCALE — a mismatch silently feeds the
+        policy out-of-distribution inputs and it drives badly for no obvious
+        reason. (Earlier this used [20,10,2,4,pi,0.05...], which did not match.)
         """
         e_y, e_psi, kappa_p, idx = self.frame(X, Y, psi, hint, lookahead_dists)
         raw = np.array([vx, vy, r, e_y, e_psi, *kappa_p], dtype=np.float32)
         scale = np.array(
-            [20.0, 10.0, 2.0, 4.0, np.pi] + [0.05] * len(lookahead_dists),
+            [4.0, 1.0, 0.5, 1.5, 0.3] + [0.05] * len(lookahead_dists),
             dtype=np.float32,
         )
         return raw / scale, e_y, e_psi, kappa_p, idx

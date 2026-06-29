@@ -127,6 +127,11 @@ class BeamNGSIL:
         self.track: Track | None = _make_track()
         self._track_hint: int = 0  # nearest-sample search hint, updated each tick
 
+        # BeamNG steering-sign vs our convention (delta>0 = turn left). Set to
+        # -1 if a positive steering command turns the car right; calibrate once
+        # by measuring the yaw-rate response (see test_sim2real_beamng.py).
+        self.steer_sign: float = 1.0
+
     # ---- lifecycle -------------------------------------------------------- #
     def open(self, launch: bool = True):
         self.bng = BeamNGpy(HOST, PORT, home=BNG_HOME, user=BNG_USER)
@@ -246,7 +251,7 @@ class BeamNGSIL:
 
     # ---- actuation -------------------------------------------------------- #
     def apply_control(self, throttle: float, brake: float, delta: float):
-        steering = float(np.clip(delta / MAX_STEER_ANGLE, -1.0, 1.0))
+        steering = float(np.clip(self.steer_sign * delta / MAX_STEER_ANGLE, -1.0, 1.0))
         self.vehicle.control(
             throttle=float(np.clip(throttle, 0.0, 1.0)),
             brake=float(np.clip(brake, 0.0, 1.0)),
