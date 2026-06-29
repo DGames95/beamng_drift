@@ -262,6 +262,8 @@ class BeamNGSIL:
             throttle=float(np.clip(throttle, 0.0, 1.0)),
             brake=float(np.clip(brake, 0.0, 1.0)),
             steering=steering,
+            parkingbrake=0.0,  # release: BeamNG spawns with the handbrake ON, which
+                               # locks the rear wheels (gear 1 + throttle, no motion)
         )
 
     def reset(self):

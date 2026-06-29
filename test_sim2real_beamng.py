@@ -40,7 +40,7 @@ from track import Track, DEFAULT_LOOKAHEAD
 
 # --- CLI defaults, edit these directly rather than retyping flags ---
 DEFAULT_MODEL   = "models/drift_dr_sim2real/best_model"  # PPO .zip (no extension)
-DEFAULT_TRACK   = "random"   # "circle" | "random"
+DEFAULT_TRACK   = "circle"   # "circle" | "random"
 DEFAULT_RADIUS  = 30.0       # circle radius [m]            (--track circle)
 DEFAULT_LENGTH  = 600.0      # open-track length [m]        (--track random)
 DEFAULT_SEED    = 42         # random-track layout seed     (--track random)
@@ -131,6 +131,28 @@ def calibrate_steering_sign(sil, probe=0.25, ticks=16, throttle=0.3):
     return sign, mean_r
 
 
+def settle_straight(sil, target, max_ticks=80):
+    """Drive straight (zero steer), holding speed, until the yaw rate and
+    lateral velocity settle — so the policy engages on a clean trajectory.
+
+    The steering-sign calibration leaves the car mid-turn (it commands a steer,
+    then stops). Engaging from that is fine on a CCW circle (the car needs to
+    turn left anyway) but wrong on a random track that starts straight: the car
+    launches yawing and sliding off the line. Settling first nulls that out.
+    Returns the settled state.
+    """
+    st = sil.get_state()
+    for _ in range(max_ticks):
+        thr = 0.3 if st["speed"] < target - 0.3 else 0.0
+        sil.apply_control(throttle=thr, brake=0.0, delta=0.0)
+        sil.step()
+        st = sil.get_state()
+        if abs(st["r"]) < 0.05 and abs(st["vy"]) < 0.4:
+            break
+    sil._prime_state()
+    return st
+
+
 def load_policy(path):
     from stable_baselines3 import PPO
     return PPO.load(path, device="cpu")
@@ -194,6 +216,18 @@ def run(args):
     sil = S.BeamNGSIL().open(launch=not args.connect)
     dt = S.DT
 
+    # Get the car ready to actually move from a standstill:
+    #  * release the parking brake — BeamNG spawns with the handbrake ON, which
+    #    locks the rear wheels (symptom: gear 1, full throttle, no motion).
+    #  * auto-shifting gearbox ("arcade") — drift configs usually have a MANUAL
+    #    transmission and spawn in neutral, so plain throttle did nothing.
+    try:
+        sil.vehicle.set_shift_mode("arcade")
+        sil.vehicle.control(throttle=0.0, brake=0.0, parkingbrake=0.0)
+        sil.step()
+    except Exception as e:
+        print(f"[test] gearbox/parkingbrake setup failed ({e}); continuing")
+
     # --- rolling start: bring the car up to speed BEFORE engaging the policy ---
     # The policy is trained always starting at ~11 m/s; BeamNG spawns at rest,
     # far out of distribution. Use beamngpy's set_velocity (forward-directed),
@@ -212,10 +246,15 @@ def run(args):
           f"steer_sign={sign:+.0f} "
           f"({'matches our convention' if sign > 0 else 'REVERSED — corrected'})")
 
-    # Anchor the track to the car's ACTUAL pose+heading now (post-roll), so the
-    # policy engages aligned with the track (e_psi ~ 0) regardless of the SIL's
-    # spawn orientation. Then re-zero the nearest-sample search hint.
-    s0 = sil.get_state()
+    # Re-straighten after the calibration turn so the car engages on a clean,
+    # straight trajectory (no residual yaw / lateral velocity). Critical for the
+    # random track, whose start is straight; a circle tolerated engaging mid-turn.
+    target = args.start_speed if args.start_speed > 0 else sil.get_state()["speed"]
+    s0 = settle_straight(sil, target)
+
+    # Anchor the track to the car's ACTUAL settled pose+heading, so the policy
+    # engages aligned with the track (e_psi ~ 0) regardless of the SIL's spawn
+    # orientation. Then re-zero the nearest-sample search hint.
     sil.track = anchor_track(
         _make_base_track(args.track, args.radius, args.length, args.seed),
         s0["X"], s0["Y"], s0["psi"])
@@ -285,10 +324,16 @@ def run(args):
             )
     except KeyboardInterrupt:
         print("\n[test] interrupted.")
+    except Exception as e:  # e.g. BNGDisconnectedError if the sim is closed/crashes
+        print(f"\n[test] sim ended early ({type(e).__name__}: {e}) — "
+              f"reporting partial telemetry.")
     finally:
-        if view is not None:
-            view.close()
-        sil.close()
+        try:
+            if view is not None:
+                view.close()
+            sil.close()
+        except Exception:
+            pass
 
     _report(log, off_track_events, args)
 
