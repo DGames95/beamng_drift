@@ -2,8 +2,8 @@
 
 The policy is trained in driftRL with DomainRandomizedDriftEnv (domain_rand.py)
 so it is robust to the reality gap. This script drives a no-ESC RWD car in
-BeamNG (the high-power Gavril Barstow by default, which has no stability
-control and drifts easily — override with --vehicle) through
+BeamNG in its dedicated drift config (the Ibishu Miramar 'drift' preset by
+default — override with --vehicle / --config) through
 sil_beamng.BeamNGSIL with that policy, shows a live top-down overlay
 (debug_view.DebugView), logs telemetry, and prints drift metrics so you can
 judge whether the transfer worked.
@@ -40,7 +40,7 @@ from track import Track, DEFAULT_LOOKAHEAD
 
 # --- CLI defaults, edit these directly rather than retyping flags ---
 DEFAULT_MODEL   = "models/drift_dr_sim2real/best_model"  # PPO .zip (no extension)
-DEFAULT_TRACK   = "circle"   # "circle" | "random"
+DEFAULT_TRACK   = "random"   # "circle" | "random"
 DEFAULT_RADIUS  = 30.0       # circle radius [m]            (--track circle)
 DEFAULT_LENGTH  = 600.0      # open-track length [m]        (--track random)
 DEFAULT_SEED    = 42         # random-track layout seed     (--track random)
@@ -48,8 +48,12 @@ DEFAULT_START_SPEED = 11.0   # rolling-start speed [m/s] before engaging policy
                              # (== driftRL reset v0; 0 disables -> standstill start)
 DEFAULT_SECONDS = 40.0       # run duration [s]
 DEFAULT_CONNECT = False      # attach to a running BeamNG instead of launching one
-DEFAULT_VEHICLE = "miramar"  # Gavril Barstow: high-power RWD V8 muscle, NO ESC,
-                             # easy to drift. Alt no-ESC: "moonhawk", "miramar"
+DEFAULT_VEHICLE = "miramar"  # RWD, no ESC. Alts: "barstow" (V8 muscle), "bx",
+                             # "sunburst2", "etkc", "pessima" — all have drift configs
+DEFAULT_CONFIG  = "drift"    # vehicle config/variant (.pc preset) to spawn, e.g.
+                             # "drift" (miramar/barstow/pessima/sbr/fullsize),
+                             # "drift_pro" (sunburst2), "pro_drift_M" (bx),
+                             # "kc8_drift_M" (etkc). "" / "stock" = default config.
 DEFAULT_OVERLAY = True       # live top-down debug overlay (debug_view.DebugView)
 DEFAULT_CSV     = None       # telemetry CSV output path (None = don't write)
 DEFAULT_CHECK   = False      # offline obs/policy check; does NOT launch BeamNG
@@ -177,8 +181,15 @@ def run(args):
     policy = load_policy(args.model_path)
     print(f"[test] policy: {args.model_path}")
 
-    # use a no-ESC, high-power RWD car so the car can actually break traction
+    # use a no-ESC RWD car, and (if given) a dedicated drift config/variant so
+    # the chassis/tyres/diff are already set up to slide
     S.VEHICLE_MODEL = args.vehicle
+    if args.config and args.config.lower() not in ("stock", "default", "none"):
+        S.VEHICLE_CONFIG = f"vehicles/{args.vehicle}/{args.config}.pc"
+        print(f"[test] vehicle: {args.vehicle}  config: {S.VEHICLE_CONFIG}")
+    else:
+        S.VEHICLE_CONFIG = None
+        print(f"[test] vehicle: {args.vehicle}  config: <default>")
 
     sil = S.BeamNGSIL().open(launch=not args.connect)
     dt = S.DT
@@ -331,7 +342,10 @@ if __name__ == "__main__":
     p.add_argument("--connect", action="store_true", default=DEFAULT_CONNECT,
                    help="attach to an already-running BeamNG instead of launching")
     p.add_argument("--vehicle", default=DEFAULT_VEHICLE,
-                   help="BeamNG vehicle model id (default: barstow, a no-ESC RWD muscle car)")
+                   help="BeamNG vehicle model id (default: miramar, a no-ESC RWD car)")
+    p.add_argument("--config", default=DEFAULT_CONFIG,
+                   help="vehicle config/variant .pc preset name (e.g. drift, drift_pro, "
+                        "pro_drift_M); 'stock' for the model default")
     p.add_argument("--no-overlay", dest="overlay", action="store_false", default=DEFAULT_OVERLAY,
                    help="disable the live top-down debug overlay")
     p.add_argument("--csv", default=DEFAULT_CSV, help="optional telemetry CSV output path")

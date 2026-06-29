@@ -62,6 +62,11 @@ PORT = 25252
 
 MAP = "smallgrid"          # empty flat infinite plane; try "gridmap_v2" for a textured pad
 VEHICLE_MODEL = "etk800"   # rwd sedan, decent for drifting; e.g. "sunburst2" (rwd) also good
+# Optional vehicle config/variant: game-relative .pc path, e.g.
+# "vehicles/miramar/drift.pc". None spawns the model's default config. Many RWD
+# cars ship a dedicated drift preset (miramar/drift, barstow/drift,
+# sunburst2/drift_pro, etkc/kc8_drift_M, bx/pro_drift_M).
+VEHICLE_CONFIG = None
 
 SPAWN_POS = (0.0, 0.0, 0.5)
 SPAWN_ROT_QUAT = (0.0, 0.0, 1.0, 0.0)   # identity -> facing +x
@@ -138,7 +143,8 @@ class BeamNGSIL:
         self.bng.open(launch=launch)
 
         scenario = Scenario(MAP, "sil_drift")
-        self.vehicle = Vehicle("ego", model=VEHICLE_MODEL, license="SIL")
+        self.vehicle = Vehicle("ego", model=VEHICLE_MODEL, license="SIL",
+                               part_config=VEHICLE_CONFIG)
         self.vehicle.attach_sensor("electrics", Electrics())
         scenario.add_vehicle(
             self.vehicle, pos=SPAWN_POS, rot_quat=SPAWN_ROT_QUAT
