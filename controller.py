@@ -100,7 +100,13 @@ class DriftController:
         # (using simplified: front-axle cross-track ≈ e_y + L/2 * sin(e_psi))
         e_y_front = e_y + (L / 2.0) * math.sin(e_psi)
 
-        delta = e_psi + math.atan2(k_e * e_y_front, max(abs(vx), v_min))
+        # Sign convention (this repo): delta>0 turns LEFT; track.py gives
+        # e_y>0 = car LEFT of line and e_psi = psi_car - psi_track (>0 = heading
+        # left). To return, both must steer RIGHT (delta<0), so the feedback
+        # terms are NEGATED. (The feedforward below is +: kappa>0 is a left bend
+        # and needs delta>0.) Without the negation the loop is positive-feedback
+        # and the car diverges off the line into the barrier.
+        delta = -e_psi - math.atan2(k_e * e_y_front, max(abs(vx), v_min))
 
         # feedforward: bicycle model steady-state delta = kappa * L
         delta += p.get("k_ff", 0.6) * kappa_ff * L

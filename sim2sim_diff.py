@@ -59,15 +59,15 @@ OUT_DIR = "report"
 VEHICLE_PARAMS_JSON = "driftRL/vehicle_params/etkc_kc8_drift_M.json"
 
 # --- defaults (edit here rather than retyping flags) ---
-DEFAULT_MODEL   = "models/drift_dr_sim2real/best_model"   # the sim-to-real DR policy
-DEFAULT_TRACK   = "random"   # "random" | "circle"
+DEFAULT_MODEL   = "driftRL/models/drift_dr_sim2real/best_model"   # the sim-to-real DR policy
+DEFAULT_TRACK   = "circle"   # "random" | "circle"
 DEFAULT_SEED    = 55         # random-track layout seed (--track random)
 DEFAULT_RADIUS  = 25.0       # circle radius [m]          (--track circle)
 DEFAULT_LENGTH  = 600.0      # open-track length [m]      (--track random)
 DEFAULT_START_SPEED = 11.0
 DEFAULT_SECONDS = 40.0
-DEFAULT_VEHICLE = "etkc"
-DEFAULT_CONFIG  = "kc8_drift_M"
+DEFAULT_VEHICLE = "sunburst2"
+DEFAULT_CONFIG  = "drift_pro"
 
 G = 9.81
 DT = 0.02   # bicycle integration step [s] (== driftRL DriftEnv.DT, == SIL control DT)

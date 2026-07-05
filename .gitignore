@@ -1,4 +1,9 @@
-# Python
+# Pytho
+*.pdf
+*.png
+
+
+
 __pycache__/
 *.py[cod]
 *.egg-info/

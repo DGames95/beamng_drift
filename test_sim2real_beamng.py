@@ -31,26 +31,32 @@ throttle (max(0,T)) / brake (max(0,-T)). Same contract as controller.py "rl".
 
 import argparse
 import csv
+import json
 import math
 
 import numpy as np
 
 import sil_beamng as S
 from track import Track, DEFAULT_LOOKAHEAD
+from automation_track import load_centerline, resample_and_build, yaw_to_quat
+from controller import DriftController
 
 # --- CLI defaults, edit these directly rather than retyping flags ---
-DEFAULT_MODEL   = "models/drift_dr_sim2real/best_model"  # PPO .zip (no extension)
-DEFAULT_TRACK   = "random"   # "circle" | "random"
-DEFAULT_RADIUS  = 30.0       # circle radius [m]            (--track circle)
+DEFAULT_MODEL   = "driftRL/models/drift_dr_sim2real/best_model"  # PPO .zip (no extension)
+DEFAULT_TRACK   = "random"   # "circle" | "random" | "automation"
+DEFAULT_RADIUS  = 20.0       # circle radius [m]            (--track circle)
 DEFAULT_LENGTH  = 600.0      # open-track length [m]        (--track random)
-DEFAULT_SEED    = 55         # random-track layout seed     (--track random)
+DEFAULT_SEED    = 24         # random-track layout seed     (--track random)
+DEFAULT_CENTERLINE = "tracks/automation_handling.npz"  # (--track automation)
+AUTOMATION_LEVEL   = "automation_test_track"
+SPAWN_Z_OFFSET     = 0.3     # drop height above the road when spawning [m]
 DEFAULT_START_SPEED = 11.0   # rolling-start speed [m/s] before engaging policy
                              # (== driftRL reset v0; 0 disables -> standstill start)
 DEFAULT_SECONDS = 40.0       # run duration [s]
 DEFAULT_CONNECT = False      # attach to a running BeamNG instead of launching one
-DEFAULT_VEHICLE = "miramar"  # RWD, no ESC. Alts: "barstow" (V8 muscle), "bx",
+DEFAULT_VEHICLE = "sunburst2"  # RWD, no ESC. Alts: "barstow" (V8 muscle), "bx",
                              # "sunburst2", "etkc", "pessima" — all have drift configs
-DEFAULT_CONFIG  = "drift"    # vehicle config/variant (.pc preset) to spawn, e.g.
+DEFAULT_CONFIG  = "drift_pro"    # vehicle config/variant (.pc preset) to spawn, e.g.
                              # "drift" (miramar/barstow/pessima/sbr/fullsize),
                              # "drift_pro" (sunburst2), "pro_drift_M" (bx),
                              # "kc8_drift_M" (etkc). "" / "stock" = default config.
@@ -85,6 +91,57 @@ def anchor_track(track, x0, y0, heading):
     new_xy = (track.xy - track.xy[0]) @ R.T + np.array([x0, y0])
     new_psi = track.psi + dpsi
     return Track(new_xy, new_psi, track.kappa, track.closed)
+
+
+def prepare_automation(centerline_path, closed):
+    """Load a saved world-fixed centerline and configure the SIL map/spawn.
+
+    Unlike the synthetic tracks, this line is fixed in the world (it IS the
+    handling course), so we do NOT anchor it to the car — we do the inverse and
+    spawn the car onto it. Sets S.MAP / S.SPAWN_POS / S.SPAWN_ROT_QUAT (read by
+    BeamNGSIL.open) and disables the SIL's synthetic-track factory. Returns the
+    world-frame Track.
+    """
+    xy, z, closed_stored = load_centerline(centerline_path)
+    track = resample_and_build(xy, closed=closed or closed_stored)
+    x0, y0 = float(track.xy[0, 0]), float(track.xy[0, 1])
+    psi0 = float(track.psi[0])
+    S.MAP = AUTOMATION_LEVEL
+    S.TRACK_MODE = None
+    S.SPAWN_POS = (x0, y0, float(z[0]) + SPAWN_Z_OFFSET)
+    S.SPAWN_ROT_QUAT = yaw_to_quat(psi0)
+    print(f"[test] automation centerline: {centerline_path}  "
+          f"({track.n} samples, ~{track.length:.0f} m, closed={track.closed})")
+    return track
+
+
+def align_to_track(sil, track, tol_deg=8.0, tries=3):
+    """Teleport-correct the car's heading to the track tangent at the spawn point.
+
+    BeamNG's spawn-orientation convention has a fixed offset (SPAWN_ROT_QUAT=
+    (0,0,1,0) is a 180 deg flip — see anchor_track), so the measured heading may
+    differ from the yaw we asked for. We measure it and re-teleport with the
+    residual folded into the commanded yaw until the car actually faces the
+    track tangent. Returns the settled state.
+    """
+    target = float(track.psi[0])
+    pos = S.SPAWN_POS
+    cmd_yaw = target
+    st = sil.get_state()
+    for _ in range(tries):
+        st = sil.get_state()
+        dpsi = math.atan2(math.sin(target - st["psi"]), math.cos(target - st["psi"]))
+        if abs(dpsi) < math.radians(tol_deg):
+            break
+        cmd_yaw += dpsi
+        sil.vehicle.teleport(pos, rot_quat=yaw_to_quat(cmd_yaw), reset=True)
+        for _ in range(int(0.4 * S.CONTROL_HZ)):
+            sil.step()
+        sil._prime_state()
+        st = sil.get_state()
+    print(f"[test] aligned to track: measured psi={math.degrees(st['psi']):+.0f}deg "
+          f"target={math.degrees(target):+.0f}deg")
+    return st
 
 
 def rolling_start(sil, target):
@@ -208,9 +265,37 @@ def check(model_path):
     print("[check] OK — obs pipeline and policy are wired correctly.")
 
 
+def make_controller(args):
+    """Build the non-RL DriftController for --controller path/drift from gains.json."""
+    with open("gains.json") as f:
+        params = json.load(f)
+    params["mode"] = args.controller
+    if args.target_speed is not None:
+        params["target_speed"] = args.target_speed
+    print(f"[test] controller: {args.controller}  base target_speed="
+          f"{params.get('target_speed')}  a_lat_cap={args.a_lat}")
+    return DriftController(params)
+
+
+def grip_target_speed(base, a_lat, kappa_preview):
+    """Corner speed for grip driving: v = sqrt(a_lat / kappa), capped at `base`.
+
+    Uses the tightest curvature in the lookahead so the car slows BEFORE the
+    apex. a_lat<=0 disables scheduling (constant `base`).
+    """
+    if a_lat <= 0 or kappa_preview is None or not len(kappa_preview):
+        return base
+    k = float(np.max(np.abs(kappa_preview)))
+    return min(base, math.sqrt(a_lat / max(k, 1e-3)))
+
+
 def run(args):
-    policy = load_policy(args.model_path)
-    print(f"[test] policy: {args.model_path}")
+    rl = args.controller == "rl"
+    policy = load_policy(args.model_path) if rl else None
+    ctrl = None if rl else make_controller(args)
+    base_speed = ctrl.params.get("target_speed", 12.0) if ctrl else 0.0
+    if rl:
+        print(f"[test] policy: {args.model_path}")
 
     # use a no-ESC RWD car, and (if given) a dedicated drift config/variant so
     # the chassis/tyres/diff are already set up to slide
@@ -221,6 +306,12 @@ def run(args):
     else:
         S.VEHICLE_CONFIG = None
         print(f"[test] vehicle: {args.vehicle}  config: <default>")
+
+    # Automation Test Track: load the world-fixed handling-course centerline and
+    # point the SIL at that level/spawn BEFORE opening it (open() reads S.MAP and
+    # S.SPAWN_*). The synthetic circle/random tracks skip this entirely.
+    automation = args.track == "automation"
+    auto_track = prepare_automation(args.centerline, args.closed) if automation else None
 
     sil = S.BeamNGSIL().open(launch=not args.connect)
     dt = S.DT
@@ -243,44 +334,61 @@ def run(args):
     except Exception as e:
         print(f"[test] startup recover/gearbox setup failed ({e}); continuing")
 
-    # --- rolling start: bring the car up to speed BEFORE engaging the policy ---
-    # The policy is trained always starting at ~11 m/s; BeamNG spawns at rest,
-    # far out of distribution. Use beamngpy's set_velocity (forward-directed),
-    # verified/topped-up until the target speed is actually reached.
-    if args.start_speed > 0:
-        print(f"[test] rolling start -> {args.start_speed:.1f} m/s ...", flush=True)
-        reached = rolling_start(sil, args.start_speed)
-        print(f"[test] rolling start reached {reached:.1f} m/s")
-
-    # --- steering-sign sanity check: verify (don't blindly trust) BeamNG's
-    # steering sign against the known default (sil.steer_sign = -1). Only an
-    # at-speed, clear-yaw reading is allowed to override it; a noisy low-speed
-    # reading is ignored, so a failed rolling start can't flip the steering and
-    # cause inverted behaviour.
-    sign, mean_r = calibrate_steering_sign(sil)
-    if sign is None:
-        print(f"[test] steering check inconclusive (r={mean_r:+.3f}) — keeping "
-              f"default steer_sign={sil.steer_sign:+.0f} (BeamNG convention)")
-    elif sign != sil.steer_sign:
-        print(f"[test] WARNING: measured steer sign {sign:+.0f} != default "
-              f"{sil.steer_sign:+.0f} (r={mean_r:+.3f}); using measured")
-        sil.steer_sign = sign
+    if automation:
+        # The world-fixed track can't be rotated to the car, so spawn the car
+        # ONTO it: correct the spawn heading to the track tangent, then roll up
+        # to speed along that tangent. No steering calibration / settle turn —
+        # those leave the car mid-corner off a narrow real road; keep the known
+        # BeamNG steer_sign default (-1, verified extensively on the synthetic
+        # tracks) instead.
+        align_to_track(sil, auto_track)
+        if args.start_speed > 0:
+            print(f"[test] rolling start -> {args.start_speed:.1f} m/s ...", flush=True)
+            reached = rolling_start(sil, args.start_speed)
+            print(f"[test] rolling start reached {reached:.1f} m/s")
+        sil.track = auto_track
+        s0 = sil.get_state()
+        sil._track_hint = auto_track.nearest(s0["X"], s0["Y"], 0)
     else:
-        print(f"[test] steering sign confirmed {sign:+.0f} (r={mean_r:+.3f})")
+        # --- rolling start: bring the car up to speed BEFORE engaging the policy ---
+        # The policy is trained always starting at ~11 m/s; BeamNG spawns at rest,
+        # far out of distribution. Use beamngpy's set_velocity (forward-directed),
+        # verified/topped-up until the target speed is actually reached.
+        if args.start_speed > 0:
+            print(f"[test] rolling start -> {args.start_speed:.1f} m/s ...", flush=True)
+            reached = rolling_start(sil, args.start_speed)
+            print(f"[test] rolling start reached {reached:.1f} m/s")
 
-    # Re-straighten after the calibration turn so the car engages on a clean,
-    # straight trajectory (no residual yaw / lateral velocity). Critical for the
-    # random track, whose start is straight; a circle tolerated engaging mid-turn.
-    target = args.start_speed if args.start_speed > 0 else sil.get_state()["speed"]
-    s0 = settle_straight(sil, target)
+        # --- steering-sign sanity check: verify (don't blindly trust) BeamNG's
+        # steering sign against the known default (sil.steer_sign = -1). Only an
+        # at-speed, clear-yaw reading is allowed to override it; a noisy low-speed
+        # reading is ignored, so a failed rolling start can't flip the steering and
+        # cause inverted behaviour.
+        sign, mean_r = calibrate_steering_sign(sil)
+        if sign is None:
+            print(f"[test] steering check inconclusive (r={mean_r:+.3f}) — keeping "
+                  f"default steer_sign={sil.steer_sign:+.0f} (BeamNG convention)")
+        elif sign != sil.steer_sign:
+            print(f"[test] WARNING: measured steer sign {sign:+.0f} != default "
+                  f"{sil.steer_sign:+.0f} (r={mean_r:+.3f}); using measured")
+            sil.steer_sign = sign
+        else:
+            print(f"[test] steering sign confirmed {sign:+.0f} (r={mean_r:+.3f})")
 
-    # Anchor the track to the car's ACTUAL settled pose+heading, so the policy
-    # engages aligned with the track (e_psi ~ 0) regardless of the SIL's spawn
-    # orientation. Then re-zero the nearest-sample search hint.
-    sil.track = anchor_track(
-        _make_base_track(args.track, args.radius, args.length, args.seed),
-        s0["X"], s0["Y"], s0["psi"])
-    sil._track_hint = 0
+        # Re-straighten after the calibration turn so the car engages on a clean,
+        # straight trajectory (no residual yaw / lateral velocity). Critical for the
+        # random track, whose start is straight; a circle tolerated engaging mid-turn.
+        target = args.start_speed if args.start_speed > 0 else sil.get_state()["speed"]
+        s0 = settle_straight(sil, target)
+
+        # Anchor the track to the car's ACTUAL settled pose+heading, so the policy
+        # engages aligned with the track (e_psi ~ 0) regardless of the SIL's spawn
+        # orientation. Then re-zero the nearest-sample search hint.
+        sil.track = anchor_track(
+            _make_base_track(args.track, args.radius, args.length, args.seed),
+            s0["X"], s0["Y"], s0["psi"])
+        sil._track_hint = 0
+
     print(f"[test] engaged: X={s0['X']:.1f} Y={s0['Y']:.1f} "
           f"psi={math.degrees(s0['psi']):+.0f}deg  "
           f"vx={s0['vx']:.2f} vy={s0['vy']:.2f} speed={s0['speed']:.2f} m/s")
@@ -320,12 +428,20 @@ def run(args):
                 print(f"\n[test] reached end of track at t={t:.1f} s")
                 break
 
-            obs = state.get("track_obs")
-            if obs is None:
-                print("[test] no track_obs (TRACK_MODE None?) — aborting")
-                break
-
-            throttle, brake, delta = policy_action(policy, obs)
+            if rl:
+                obs = state.get("track_obs")
+                if obs is None:
+                    print("[test] no track_obs (TRACK_MODE None?) — aborting")
+                    break
+                throttle, brake, delta = policy_action(policy, obs)
+            else:
+                # grip/path (or drift) PID. For grip, schedule corner speed from
+                # the curvature preview so it brakes before tight bends.
+                tf_now = state.get("track_frame")
+                if tf_now is not None:
+                    ctrl.params["target_speed"] = grip_target_speed(
+                        base_speed, args.a_lat, tf_now[2])
+                throttle, brake, delta = ctrl(state, t, dt)
             sil.apply_control(throttle, brake, delta)
             sil.step()
 
@@ -396,7 +512,20 @@ if __name__ == "__main__":
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--model-path", default=DEFAULT_MODEL,
                    help="PPO .zip (without extension) to run")
-    p.add_argument("--track", choices=["circle", "random"], default=DEFAULT_TRACK)
+    p.add_argument("--controller", choices=["rl", "path", "drift"], default="rl",
+                   help="rl = trained policy; path = grip PID (Stanley+PI); "
+                        "drift = sideslip PID (gains from gains.json)")
+    p.add_argument("--target-speed", type=float, default=None,
+                   help="base target speed [m/s] for path/drift (overrides gains.json)")
+    p.add_argument("--a-lat", type=float, default=8.0,
+                   help="lateral-accel cap [m/s^2] for grip corner-speed scheduling "
+                        "(path mode; 0 = constant target speed)")
+    p.add_argument("--track", choices=["circle", "random", "automation"],
+                   default=DEFAULT_TRACK)
+    p.add_argument("--centerline", default=DEFAULT_CENTERLINE,
+                   help="world-fixed centerline .npz (--track automation)")
+    p.add_argument("--closed", action="store_true",
+                   help="treat the automation centerline as a closed loop")
     p.add_argument("--radius", type=float, default=DEFAULT_RADIUS,
                    help="circle radius [m] (--track circle)")
     p.add_argument("--length", type=float, default=DEFAULT_LENGTH,

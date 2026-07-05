@@ -40,6 +40,30 @@ def _lstsq(A: np.ndarray, b: np.ndarray) -> np.ndarray:
     return theta
 
 
+def _ols(A: np.ndarray, b: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """OLS solve returning (theta, standard_errors, covariance).
+
+    Standard errors come from the usual sigma^2 (A^T A)^-1 covariance, where
+    sigma^2 = RSS / (n - p). They quantify how well-constrained each parameter
+    is *given the model* — wide SEs flag a param the data barely pins down, which
+    is exactly the "general uncertainty" signal we want to carry into the
+    randomization ranges. (They do NOT capture model mismatch, i.e. BeamNG not
+    actually being a linear bicycle; the fit R2 and regime coverage do that.)
+    """
+    theta, *_ = np.linalg.lstsq(A, b, rcond=None)
+    resid = b - A @ theta
+    n, p = A.shape
+    dof = max(n - p, 1)
+    sigma2 = float(resid @ resid) / dof
+    try:
+        cov = sigma2 * np.linalg.pinv(A.T @ A)
+        se = np.sqrt(np.clip(np.diag(cov), 0.0, None))
+    except np.linalg.LinAlgError:
+        cov = np.full((p, p), np.nan)
+        se = np.full(p, np.nan)
+    return theta, se, cov
+
+
 # ---------------------------------------------------------------------------
 # Fitting functions
 # ---------------------------------------------------------------------------
@@ -54,12 +78,16 @@ def fit_drag(vx: np.ndarray, ax: np.ndarray, M: float) -> dict:
     """
     A = (-vx * np.abs(vx)).reshape(-1, 1)
     b = M * ax
-    theta = _lstsq(A, b)
+    theta, se, cov = _ols(A, b)
     y_hat = A @ theta
     return {
         "C_DRAG": float(theta[0]),
+        "C_DRAG_se": float(se[0]),
+        "cov": cov.tolist(),              # 1x1 covariance for [C_DRAG]
+        "params": ["C_DRAG"],
         "R2": float(_r2(b, y_hat)),
         "RMSE": float(np.sqrt(np.mean((b - y_hat) ** 2))),
+        "n": int(len(b)),
     }
 
 
@@ -74,13 +102,24 @@ def fit_drivetrain(T: np.ndarray, vx: np.ndarray, ax: np.ndarray, M: float) -> d
     """
     A = np.column_stack([T, -vx * np.abs(vx)])
     b = M * ax
-    theta = _lstsq(A, b)
+    theta, se, cov = _ols(A, b)
     y_hat = A @ theta
+    # correlation between the two estimates — for a short accel these are
+    # strongly (negatively) correlated, which is exactly why a JOINT
+    # F_DRIVE_MAX / C_DRAG fit is ill-conditioned on this data.
+    denom = se[0] * se[1]
+    corr = float(cov[0, 1] / denom) if denom > 0 else float("nan")
     return {
         "F_DRIVE_MAX": float(theta[0]),
+        "F_DRIVE_MAX_se": float(se[0]),
         "C_DRAG": float(theta[1]),
+        "C_DRAG_se": float(se[1]),
+        "cov": cov.tolist(),              # 2x2 covariance for [F_DRIVE_MAX, C_DRAG]
+        "params": ["F_DRIVE_MAX", "C_DRAG"],
+        "corr_Fdrive_Cdrag": corr,
         "R2": float(_r2(b, y_hat)),
         "RMSE": float(np.sqrt(np.mean((b - y_hat) ** 2))),
+        "n": int(len(b)),
     }
 
 
@@ -163,6 +202,111 @@ def fit_bicycle_linear(
         "IZ": float(IZ),
         "R2_vy": float(_r2(b_vy, A_vy @ theta)),
         "R2_r": float(_r2(A_r @ theta, np.zeros(N))),  # how well yaw eq closes
+    }
+
+
+def fit_drive_fixed_drag(T: np.ndarray, vx: np.ndarray, ax: np.ndarray,
+                         M: float, C_DRAG: float) -> dict:
+    """F_DRIVE_MAX with C_DRAG FIXED (from the coast-down), decoupling the two.
+
+    The joint accel fit is ill-conditioned (F_DRIVE_MAX and C_DRAG are strongly
+    correlated over a short pull) and on a drift car wheelspin throws away the
+    high-throttle samples, collapsing it to a single throttle level -> a
+    degenerate, sometimes negative, estimate. With C_DRAG known, each
+    non-wheelspin sample gives a direct estimate
+
+        F_DRIVE_MAX_i = (M*ax_i + C_DRAG*vx_i*|vx_i|) / T_i ,
+
+    valid only where the rear isn't spinning (otherwise Fx_r is traction-capped,
+    not T*F_DRIVE_MAX). We report the median and the robust spread; if the engine
+    map is nonlinear in throttle the per-throttle medians will fan out, which the
+    returned breakdown exposes.
+    """
+    T = np.asarray(T, float); vx = np.asarray(vx, float); ax = np.asarray(ax, float)
+    keep = T > 0.02
+    est = (M * ax[keep] + C_DRAG * vx[keep] * np.abs(vx[keep])) / T[keep]
+    est = est[np.isfinite(est)]
+    if len(est) < 6:
+        return {"F_DRIVE_MAX": None, "n": int(len(est)), "method": "fixed-C_DRAG"}
+    med = float(np.median(est))
+    # robust std from the IQR (1.349 sigma between the quartiles)
+    q25, q75 = np.percentile(est, [25, 75])
+    robust_std = float((q75 - q25) / 1.349)
+    by_T = {}
+    for t in np.unique(np.round(T[keep], 2)):
+        m = np.round(T[keep], 2) == t
+        if m.sum() >= 3:
+            by_T[float(t)] = round(float(np.median(est[m])), 1)
+    return {
+        "F_DRIVE_MAX": med,
+        "F_DRIVE_MAX_robust_std": robust_std,
+        "per_throttle_median": by_T,
+        "n": int(len(est)),
+        "method": "fixed-C_DRAG per-sample median",
+    }
+
+
+def fit_axle_tire(alpha: np.ndarray, Fy: np.ndarray, alpha_lin_deg: float = 2.0) -> dict:
+    """Fit a single axle's tyre curve from steady-state (slip, lateral-force) data.
+
+    This is the robust replacement for the old joint-chirp OLS. The skidpad
+    maneuver hands us per-axle lateral force directly from steady-state force
+    balance (no noisy differentiation), so we just need to characterise the
+    curve Fy(alpha):
+
+      * cornering stiffness CA  — slope at small slip, where Fy ≈ -CA*alpha.
+        Fit through the origin on the near-linear core (|alpha| < alpha_lin).
+      * saturation Fy_sat       — the peak |Fy| the axle reached; this sets MU
+        once divided by the axle's vertical load. Flagged as a *lower bound*
+        unless the data actually rolled into saturation (outer-band slope well
+        below CA), since a gentle run may never have hit the limit.
+
+    Args:
+        alpha:        slip angle [rad] (sign: positive slip -> negative Fy)
+        Fy:           lateral force on the axle [N]
+        alpha_lin_deg: half-width of the near-linear core for the stiffness fit
+    """
+    a = np.asarray(alpha, dtype=float)
+    f = np.asarray(Fy, dtype=float)
+
+    alin = float(np.radians(alpha_lin_deg))
+    core = np.abs(a) < alin
+    if core.sum() < 6:                       # sparse core -> widen to inner 50%
+        alin = float(np.percentile(np.abs(a), 50)) if len(a) else alin
+        core = np.abs(a) <= alin
+
+    A = (-a[core]).reshape(-1, 1)            # Fy = -CA * alpha
+    theta, se, cov = _ols(A, f[core])
+    CA = float(theta[0])
+    CA_se = float(se[0])
+    CA_var = float(cov[0, 0])
+
+    absf = np.abs(f)
+    Fy_sat = float(np.percentile(absf, 95)) if len(f) else float("nan")
+    amax = float(np.max(np.abs(a))) if len(a) else 0.0
+
+    # outer-band incremental slope: a big drop vs CA means the tyre rolled into
+    # saturation in this dataset (so Fy_sat is a real peak, not a lower bound)
+    outer = np.abs(a) > alin
+    sat_ratio = float("nan")
+    if outer.sum() >= 6:
+        Ao = (-a[outer]).reshape(-1, 1)
+        to, _, _ = _ols(Ao, f[outer])
+        sat_ratio = float(to[0] / CA) if CA != 0 else float("nan")
+    reached_sat = (not np.isnan(sat_ratio)) and sat_ratio < 0.6 and amax > 1.5 * alin
+
+    return {
+        "CA": CA,
+        "CA_se": CA_se,
+        "CA_var": CA_var,
+        "Fy_sat": Fy_sat,
+        "alpha_lin_deg": float(np.degrees(alin)),
+        "alpha_max_deg": float(np.degrees(amax)),
+        "outer_slope_ratio": sat_ratio,
+        "reached_saturation": bool(reached_sat),
+        "n_core": int(core.sum()),
+        "n_total": int(len(a)),
+        "R2_core": float(_r2(f[core], A @ theta)) if core.sum() else float("nan"),
     }
 
 

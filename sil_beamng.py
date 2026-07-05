@@ -79,9 +79,13 @@ STEPS_PER_TICK = PHYSICS_HZ // CONTROL_HZ
 DT = STEPS_PER_TICK / PHYSICS_HZ        # control timestep [s]
 
 # Steering calibration: physical road-wheel angle [rad] that corresponds to
-# full lock (normalized steering = 1.0). ~30 deg is a reasonable start for the
-# etk800; calibrate with calibrate_max_steer() for accuracy.
-MAX_STEER_ANGLE = math.radians(30.0)
+# full lock (normalized steering = 1.0). Calibrated for etkc/kc8_drift_M by
+# sysid_probe.py from slow kinematic circles (delta = L*r/vx): ~41.5 deg,
+# consistent across steer levels. The drift config carries EXTENDED steering
+# lock (~41 deg vs a stock car's ~33), so the old 30 deg guess under-applied
+# the road-wheel angle by ~38% — that calibration error flipped the front
+# cornering-stiffness sign in the first sysid run. Re-calibrate per vehicle/config.
+MAX_STEER_ANGLE = math.radians(41.5)
 
 # --------------------------------------------------------------------------- #
 # Track configuration                                                          #
